@@ -125,7 +125,7 @@ def measure_single_series_nuclei_volume(imageds, image_name, series_name):
 
     pathsave(thresholded, 'thresholded.tif')
 
-    no_small = remove_small_objects(thresholded, min_size=10000).view(Image3D)
+    no_small = remove_small_objects(thresholded, min_size=3000).view(Image3D)
 
     pathsave(no_small, 'no_small.tif')
 
