@@ -15,129 +15,120 @@ from scipy.ndimage.morphology import binary_dilation
 from skimage.restoration import denoise_tv_chambolle
 
 
-def apply_mask_to_image(mask, image):
+from transforms import (
+    blur_3D,
+    convex_hull_per_plane,
+    threshold_otsu_3D,
+    find_largest_object
+)
 
-    image[np.where(np.logical_not(mask))] = 0
 
-    return image
+from transforms import apply_mask_3D, denoise_tv_3D, iter_plane, transformation_3D, remove_small_objects_3D
 
 
-def get_cell_mask(cell_stack):
+@transformation_3D
+def find_cell_mask(cell_stack):
 
     pz = float(cell_stack.metadata.PhysicalSizeZ)
     px = float(cell_stack.metadata.PhysicalSizeX)
     vr = pz / px
 
     # Find cell
-    blurred = gaussian_filter(cell_stack, sigma=[2*vr, 2*vr, 2]).view(Image3D)
-    thresholded = (blurred > threshold_otsu(blurred)).view(Image3D)
-    connected_components = label(thresholded)
+    blurred = blur_3D(cell_stack, sigma=[2*vr, 2*vr, 2])
+    thresholded = threshold_otsu_3D(blurred, mult=0.5)
+    largest_object = find_largest_object(thresholded)
+    chulls = convex_hull_per_plane(largest_object)
 
-    # We assume (and assert) that we only find one object
-    assert len(np.unique(connected_components)) == 2
-    mask = np.zeros(cell_stack.shape, dtype=np.uint8)
-    mask[np.where(connected_components == 1)] = 255
-    binary_dilated_mask = binary_dilation(mask, iterations=10)
-
-    return binary_dilated_mask.view(Image3D)
+    return chulls
 
 
-def remove_nuclei_noise(nuclei_stack):
+@transformation_3D
+def subtract_bg_clipped_masked_median(stack, mask):
 
-    return denoise_tv_chambolle(nuclei_stack, weight=0.1).view(Image3D)    
+    def subtract_masked_med_and_clip(im_mask):
+        im, mask = im_mask
+        med = np.median(im[np.where(mask)])
+        return (im - med).clip(min=0)
+
+    im_mask_gen = zip(iter_plane(stack), iter_plane(mask))
+
+    return np.dstack(map(subtract_masked_med_and_clip, im_mask_gen))
 
 
-def clipped_subtraction(im1, im2):
+def measure_object_volume(stack):
 
-    diff = im1.astype(np.int16) - im2.astype(np.int16)
+    px = float(stack.metadata.PhysicalSizeX)
+    py = float(stack.metadata.PhysicalSizeY)
+    pz = float(stack.metadata.PhysicalSizeZ)
 
-    diff.clip(min=0, max=255)
+    voxel_volume = px * py * pz
 
-    return diff.astype(np.uint8)
+    return np.sum(stack) * voxel_volume
 
 
-def dump_properties(cell_objects):
+def find_nuclei_mask(nuclear_stack, cell_mask):
 
-    labels = list(np.unique(cell_objects))
-    labels.remove(0)
+    masked_nuclear_stack = apply_mask_3D(nuclear_stack, cell_mask)
+    denoised = denoise_tv_3D(masked_nuclear_stack, weight=0.1)
+    nobg = subtract_bg_clipped_masked_median(denoised, cell_mask)
+    thresholded = threshold_otsu_3D(nobg)
+    nosmall = remove_small_objects_3D(thresholded)
 
-    for l in labels:
-        coords = np.where(cell_objects == l)
-        print(len(coords[0]))
+    return nosmall
+
+
+def estimate_cell_volume_from_mask(cell_mask):
+    px = float(cell_mask.metadata.PhysicalSizeX)
+    largest_disc = np.sum(cell_mask, axis=(0, 1)).max()
+
+    # Estimate volume from radius
+    radius = np.sqrt(largest_disc/np.pi)
+    radius_microns = radius * px
+    estimated_volume = (4 / 3) * np.pi * (radius_microns ** 3)
+
+    return estimated_volume
+
+
+def measure_cell_and_nuclear_volumes(imageds, image_name, series_name):
+    cell_stack = imageds.get_stack(image_name, series_name, 1)
+    cell_mask = find_cell_mask(cell_stack)
+    estimated_cell_volume_in_microns = estimate_cell_volume_from_mask(cell_mask)
+
+    nuclear_stack = imageds.get_stack(image_name, series_name, 0)
+    nuclei_mask = find_nuclei_mask(nuclear_stack, cell_mask)
+
+    nuclear_volume_in_microns = measure_object_volume(nuclei_mask)  
+
+    print("{},{},{},{}".format(image_name, series_name, estimated_cell_volume_in_microns, nuclear_volume_in_microns))
 
 
 def measure_all_items(imageds):
 
-    # image_name = '050218_WT_tapetum_protoplasts_Hoechst_GFP'
-    # series_name = 'Series001'
-    # # image_name = '240819_amiRILP1_1.5hwrolling_Hoechst'
-    # # series_name = 'Series036'
+    ins_sns = (
+        (image_name, series_name)
+        for image_name in imageds.get_image_names()
+        for series_name in imageds.get_series_names(image_name)
+    )
 
-    for image_name in imageds.get_image_names():
-        series_names = [sn for sn in imageds.get_series_names(image_name) if 'Series' in sn]
-        for series_name in sorted(series_names):
-            measure_single_series_nuclei_volume(imageds, image_name, series_name)
+    selected_ins_sns = filter(lambda x: 'Series' in x[1], ins_sns)
+
+    i = next(selected_ins_sns)
+    i = next(selected_ins_sns)
 
 
-def measure_single_series_nuclei_volume(imageds, image_name, series_name):
-    cell_stack = imageds.get_stack(image_name, series_name, 1)
-    nuclei_stack = imageds.get_stack(image_name, series_name, 0)
+    print(*i)
 
-    output_dirpath = Path('scratch/working')
+    measure_cell_and_nuclear_volumes(imageds, *i)
 
-    (output_dirpath/image_name/series_name).mkdir(exist_ok=True, parents=True)
-    def pathsave(stack, filename):
-        full_path = output_dirpath/image_name/series_name/filename
+    # # image_name = '050218_WT_tapetum_protoplasts_Hoechst_GFP'
+    # # series_name = 'Series001'
+    # # # image_name = '240819_amiRILP1_1.5hwrolling_Hoechst'
+    # # # series_name = 'Series036'
 
-        stack.save(full_path)
-
-    pathsave(cell_stack, 'cell.tif')
-    pathsave(nuclei_stack, 'nuclei.tif')
-
-    cell_mask = get_cell_mask(cell_stack)
-
-    pathsave(cell_mask, 'cell_mask.tif')
-
-    masked_nuclei_stack = apply_mask_to_image(cell_mask, nuclei_stack)
-
-    pathsave(masked_nuclei_stack, 'masked_stack.tif')
-
-    denoised = remove_nuclei_noise(masked_nuclei_stack)
-
-    pathsave(denoised, 'denoised.tif')
-
-    planes = []
-    for z in range(denoised.shape[2]):
-        denoised_z = denoised[:,:,z]
-        cell_mask_z = cell_mask[:,:,z]
-        median_z = np.median(denoised_z[np.where(cell_mask_z != 0)])
-        sub = denoised_z - median_z
-        clipped = sub.clip(min=0)
-        planes.append(clipped)
-
-    nobg = np.dstack(planes).view(Image3D)
-
-    pathsave(nobg, 'background_removal.tif')
-
-    pathsave(denoised, 'denoised.tif')
-
-    thresholded = nobg > threshold_otsu(nobg)
-
-    pathsave(thresholded, 'thresholded.tif')
-
-    no_small = remove_small_objects(thresholded, min_size=3000).view(Image3D)
-
-    pathsave(no_small, 'no_small.tif')
-
-    px = float(nuclei_stack.metadata.PhysicalSizeX)
-    py = float(nuclei_stack.metadata.PhysicalSizeY)
-    pz = float(nuclei_stack.metadata.PhysicalSizeX)
-
-    voxel_volume = px * py * pz
-
-    nuclear_volume = np.sum(no_small) * voxel_volume
-
-    print('{},{},{:02f}'.format(image_name, series_name,nuclear_volume))
+    # for image_name in imageds.get_image_names():
+    #     series_names = [sn for sn in imageds.get_series_names(image_name) if 'Series' in sn]
+    #     for series_name in sorted(series_names):
+    #         measure_single_series_nuclei_volume(imageds, image_name, series_name)
 
 
 @click.command()
