@@ -90,3 +90,16 @@ def denoise_tv_3D(stack, weight=0.1):
 @transformation_3D
 def remove_small_objects_3D(stack, min_size=3000):
     return remove_small_objects(stack, min_size=min_size)
+
+
+@transformation_3D
+def subtract_bg_clipped_masked_median(stack, mask):
+
+    def subtract_masked_med_and_clip(im_mask):
+        im, mask = im_mask
+        med = np.median(im[np.where(mask)])
+        return (im - med).clip(min=0)
+
+    im_mask_gen = zip(iter_plane(stack), iter_plane(mask))
+
+    return np.dstack(map(subtract_masked_med_and_clip, im_mask_gen))
