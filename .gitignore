@@ -4,3 +4,5 @@
 scratch
 data/
 results/
+__pycache__
+*.csv
