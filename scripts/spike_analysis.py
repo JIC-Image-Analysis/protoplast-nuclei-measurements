@@ -1,3 +1,5 @@
+import math
+
 import click
 
 import numpy as np
@@ -12,6 +14,7 @@ from skimage.morphology import label
 from scipy.ndimage.filters import gaussian_filter, median_filter
 from scipy.ndimage.morphology import binary_dilation
 
+from dtoolbioimage import ImageDataSet, Image3D
 
 def find_objects(im3d):
 
@@ -122,18 +125,74 @@ def measure_single_item(dataset, identifier):
     mimsave('thresholded.tif', 255 * thresholded.astype(np.uint8))
 
 
+def largest_label(connected_components):
+
+    labels = set(np.unique(connected_components)) - set([0])
+
+    size_by_label = 0
+
+
+def get_estimated_volume_from_cell_stack(cell_stack):
+
+    pz = float(cell_stack.metadata.PhysicalSizeZ)
+    px = float(cell_stack.metadata.PhysicalSizeX)
+    vr = pz / px
+
+    # Find cell
+    blurred = gaussian_filter(cell_stack, sigma=[2*vr, 2*vr, 2]).view(Image3D)
+    # blurred.save('blurred.tif')
+    thresholded = (blurred > threshold_otsu(blurred)).view(Image3D)
+    # thresholded.save('thresholded.tif')
+    connected_components = label(thresholded)
+    assert len(np.unique(connected_components)) == 2
+
+    # Find the largest disc in the stack
+    cell_label = 1
+    def size_of_label_in_plane(z):
+        return len(np.where(connected_components[:,:,z] == cell_label)[0])
+
+    _, _, zdim = connected_components.shape
+    largest_disc = max(size_of_label_in_plane(z) for z in range(zdim))
+
+    # Estimate volume from radius
+    radius = math.sqrt(largest_disc/math.pi)
+    radius_microns = radius * px
+    estimated_volume = (4 / 3) * math.pi * math.pow(radius_microns, 3)
+
+    return estimated_volume
+
+
+def process_single_series(ids, image_name, series_name):
+
+    cell_stack = ids.get_stack(image_name, series_name, 1)
+
+    vol = get_estimated_volume_from_cell_stack(cell_stack)
+
+    print("{}: {:02f} cu. microns".format(series_name, vol))
+
+
 @click.command()
 @click.argument('dataset_uri')
 def main(dataset_uri):
 
-    ds = DataSet.from_uri(dataset_uri)
+    ids = ImageDataSet(dataset_uri)
 
-    identifier = "230d9b0a03c361010c680134e4ac743a4396ced2"
-    mixed_identifier = "dd3c76d172e3d366b44051faaaff268990ed16f1"
+    image_name = '050218_WT_tapetum_protoplasts_Hoechst_GFP'
+    series_name = 'Series001'
 
-    # measure_single_item(ds, identifier)
+    selected_names = sorted(n for n in ids.get_series_names(image_name) if 'Series' in n)
+    # for series_name in ['Series001', 'Series002', 'Series003']:
+    for series_name in selected_names:
+        process_single_series(ids, image_name, series_name)
 
-    measure_mixed_channel_image(ds, mixed_identifier)
+    # ds = DataSet.from_uri(dataset_uri)
+
+    # identifier = "230d9b0a03c361010c680134e4ac743a4396ced2"
+    # mixed_identifier = "dd3c76d172e3d366b44051faaaff268990ed16f1"
+
+    # # measure_single_item(ds, identifier)
+
+    # measure_mixed_channel_image(ds, mixed_identifier)
 
 
 if __name__ == '__main__':
